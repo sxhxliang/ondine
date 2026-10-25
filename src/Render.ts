@@ -115,6 +115,8 @@ export declare namespace render {
     readonly fontSize?: number | undefined
     /** Prefix for element IDs, to keep several diagrams on one page apart. */
     readonly idPrefix?: string | undefined
+    /** Whether the SVG inlines its theme as concrete colors instead of `--ondine-*` custom properties. Defaults to `false`, which keeps variables so a host stylesheet can retheme without re-rendering. Static output rasterises in resvg, which does not resolve custom properties. */
+    readonly inlineTheme?: boolean | undefined
     /** The most characters of source to accept. Defaults to `50000`. */
     readonly limit?: number | undefined
     /** The most edges a flowchart may have. Defaults to `5000`. */
@@ -129,6 +131,20 @@ export declare namespace render {
     readonly padding?: number | undefined
     /** Whether the SVG scales to its container. Defaults to `true`. */
     readonly responsive?: boolean | undefined
+    /** Static-mode accent color. Ignored unless `inlineTheme` is `true`. */
+    readonly themeAccent?: string | undefined
+    /** Static-mode background color. Ignored unless `inlineTheme` is `true`. */
+    readonly themeBackground?: string | undefined
+    /** Static-mode border color. Ignored unless `inlineTheme` is `true`. */
+    readonly themeBorder?: string | undefined
+    /** Static-mode font stack. Ignored unless `inlineTheme` is `true`. */
+    readonly themeFont?: string | undefined
+    /** Static-mode foreground (text) color. Ignored unless `inlineTheme` is `true`. */
+    readonly themeForeground?: string | undefined
+    /** Static-mode line color. Ignored unless `inlineTheme` is `true`. */
+    readonly themeLine?: string | undefined
+    /** Static-mode node surface color. Ignored unless `inlineTheme` is `true`. */
+    readonly themeSurface?: string | undefined
   }
 
   /** A rendered diagram. */

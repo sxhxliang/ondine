@@ -44,7 +44,33 @@ pub(crate) const CRITICAL: &str = "var(--ondine-critical,var(--_fg))";
 pub(crate) const STROKE: &str = "var(--_sw)";
 
 /// The font stack labels are drawn in when the page sets no `--ondine-font`.
-const FONT: &str = "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace";
+pub(crate) const FONT: &str = "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace";
+
+/// The private aliases of `ROOT_STYLE`, as the `var()` expression each one
+/// stands for. Static mode resolves content through this table instead of
+/// leaving the aliases for a host stylesheet to resolve.
+pub(crate) const ALIAS_DEFS: [(&str, &str); 14] = [
+    (
+        "--_a",
+        "var(--ondine-surface-alt,color-mix(in srgb,var(--_fg) 20%,var(--_bg)))",
+    ),
+    ("--_b", "var(--ondine-border,var(--_fg))"),
+    ("--_bg", "var(--ondine-bg,#fff)"),
+    ("--_c", "var(--ondine-accent,var(--_fg))"),
+    ("--_fg", "var(--ondine-fg,#000)"),
+    (
+        "--_fm",
+        "var(--ondine-font,ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace)",
+    ),
+    ("--_hw", "var(--ondine-heading-weight,bold)"),
+    ("--_l", "var(--ondine-line,var(--_fg))"),
+    ("--_m", "var(--ondine-muted,var(--_fg))"),
+    ("--_r", "var(--ondine-radius,0)"),
+    ("--_s", "var(--ondine-surface,var(--_bg))"),
+    ("--_sw", "var(--ondine-stroke,2px)"),
+    ("--_tw", "var(--ondine-title-weight,bold)"),
+    ("--_w", "var(--ondine-bold-weight,bold)"),
+];
 
 /// The root's font declarations at `size` pixels. Ondine measures every font as monospace, so the
 /// font comes only from `--ondine-font`, for both Pele's normal and monospace stacks. The rest of
@@ -61,6 +87,24 @@ pub(crate) fn font_style(size: f64) -> String {
     out.push_str(FONT);
     out.push_str(
         ");font-kerning:none;font-variant-ligatures:none;text-rendering:geometricPrecision",
+    );
+    out
+}
+
+/// The root's font declarations at `size` pixels with the font stack
+/// inlined, for static mode. Identical to `font_style` except the stack
+/// stands where `font_style` leaves `var(--ondine-font, …)`, so a
+/// rasteriser that does not resolve custom properties still finds it.
+pub(crate) fn static_font_style(size: f64) -> String {
+    let mut out = String::with_capacity(256);
+    out.push_str(";--_fm:");
+    out.push_str(FONT);
+    out.push_str(";font:");
+    push_number(&mut out, size);
+    out.push_str("px monospace;letter-spacing:normal;word-spacing:normal;text-transform:none;direction:ltr;font-family:");
+    out.push_str(FONT);
+    out.push_str(
+        ";font-kerning:none;font-variant-ligatures:none;text-rendering:geometricPrecision",
     );
     out
 }

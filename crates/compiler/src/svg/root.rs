@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 
 use crate::svg::builder::{esc, esc_text};
-use crate::svg::theme::{RADIUS, ROOT_STYLE, ROUNDED, font_style};
+use crate::svg::theme::{
+    ALIAS_DEFS, FONT, RADIUS, ROOT_STYLE, ROUNDED, font_style, static_font_style,
+};
 use crate::yaml::push_number;
 
 /// The host's options that the shared SVG modules read. A subset of Pele's `RenderOptions`;
@@ -24,6 +26,13 @@ pub(crate) struct RenderOptions {
     pub(crate) image_schemes: Option<Vec<String>>,
     /// Whether images are drawn. On unless `Some(false)`.
     pub(crate) images: Option<bool>,
+    /// Whether the SVG inlines its theme instead of leaving it in
+    /// `--ondine-*` custom properties. Off unless `Some(true)`: the
+    /// default output keeps variables so a host stylesheet can retheme
+    /// a diagram without re-rendering it. Static output is for
+    /// rasterisers that do not resolve custom properties (resvg), and
+    /// honours the `theme_*` fields below when they are set.
+    pub(crate) inline_theme: Option<bool>,
     /// The most UTF-16 units of source to accept. 50,000 when absent.
     pub(crate) limit: Option<f64>,
     /// The `rel` of links. `noopener` when absent; empty omits it.
@@ -46,6 +55,20 @@ pub(crate) struct RenderOptions {
     pub(crate) padding: Option<f64>,
     /// Whether the document scales down to its container. On unless `Some(false)`.
     pub(crate) responsive: Option<bool>,
+    /// Static-mode accent color. Ignored unless `inline_theme` is on.
+    pub(crate) theme_accent: Option<String>,
+    /// Static-mode background color. Ignored unless `inline_theme` is on.
+    pub(crate) theme_background: Option<String>,
+    /// Static-mode border color. Ignored unless `inline_theme` is on.
+    pub(crate) theme_border: Option<String>,
+    /// Static-mode font stack. Ignored unless `inline_theme` is on.
+    pub(crate) theme_font: Option<String>,
+    /// Static-mode foreground (text) color. Ignored unless `inline_theme` is on.
+    pub(crate) theme_foreground: Option<String>,
+    /// Static-mode line color. Ignored unless `inline_theme` is on.
+    pub(crate) theme_line: Option<String>,
+    /// Static-mode node surface color. Ignored unless `inline_theme` is on.
+    pub(crate) theme_surface: Option<String>,
 }
 
 /// A diagram's accessible title and description.
@@ -122,6 +145,388 @@ fn push_rounded(out: &mut String, tag: &str) -> bool {
 /// name in its public variable.
 const WEIGHTS: [(&str, &str); 3] = [("--_tw", "title"), ("--_hw", "heading"), ("--_w", "bold")];
 
+/// A theme resolved to concrete values, for static mode. Every field is
+/// a color (or a font stack) with no `var()` left in it.
+struct StaticTheme {
+    /// Alternate surface: 20% foreground over the background.
+    alt: String,
+    /// Node surface color.
+    surface: String,
+    /// Accent color.
+    accent: String,
+    /// Background color.
+    bg: String,
+    /// Border color.
+    border: String,
+    /// Foreground (text) color.
+    fg: String,
+    /// Font stack, with double quotes single-quoted so it cannot end
+    /// a double-quoted attribute early.
+    font: String,
+    /// Line color.
+    line: String,
+}
+
+/// Pushes `font` with every double quote single-quoted. A font stack
+/// from a host may quote family names (`"Segoe UI"`); left double-quoted
+/// inside a double-quoted attribute, the first such quote would end the
+/// attribute and truncate the whole root style.
+fn push_sanitized_font(out: &mut String, font: &str) {
+    for ch in font.chars() {
+        if ch == '"' {
+            out.push('\'');
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+/// Pushes two lowercase hex digits for one channel.
+fn push_hex_byte(out: &mut String, value: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(char::from(HEX[(value >> 4) as usize]));
+    out.push(char::from(HEX[(value & 0x0f) as usize]));
+}
+
+/// Parses `#rgb` or `#rrggbb` into channels. Anything else is not a
+/// color static mode can mix, so it resolves to nothing.
+fn parse_hex_color(text: &str) -> Option<(u8, u8, u8)> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let text = text.trim().trim_start_matches('#');
+    let bytes = text.as_bytes();
+    if bytes.len() == 3 {
+        let r = nibble(bytes[0])?;
+        let g = nibble(bytes[1])?;
+        let b = nibble(bytes[2])?;
+        Some((r * 17, g * 17, b * 17))
+    } else if bytes.len() == 6 {
+        let channel = |hi: u8, lo: u8| Some(nibble(hi)? * 16 + nibble(lo)?);
+        Some((
+            channel(bytes[0], bytes[1])?,
+            channel(bytes[2], bytes[3])?,
+            channel(bytes[4], bytes[5])?,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Resolves the static theme from the host options. Unset colors fall
+/// back exactly as `ROOT_STYLE` falls back: lines, borders, accents and
+/// muted text to the foreground, surfaces to the background.
+fn static_theme(options: &RenderOptions) -> StaticTheme {
+    let bg = options
+        .theme_background
+        .as_deref()
+        .unwrap_or("#fff")
+        .to_string();
+    let fg = options
+        .theme_foreground
+        .as_deref()
+        .unwrap_or("#000")
+        .to_string();
+    let line = options.theme_line.as_deref().unwrap_or(&fg).to_string();
+    let border = options.theme_border.as_deref().unwrap_or(&fg).to_string();
+    let surface = options.theme_surface.as_deref().unwrap_or(&bg).to_string();
+    let accent = options.theme_accent.as_deref().unwrap_or(&fg).to_string();
+    let mut font = String::new();
+    if let Some(host) = options.theme_font.as_deref() {
+        push_sanitized_font(&mut font, host);
+    } else {
+        font.push_str(FONT);
+    }
+    let alt = match (parse_hex_color(&fg), parse_hex_color(&bg)) {
+        (Some(fg_rgb), Some(bg_rgb)) => {
+            let mut mixed = String::with_capacity(7);
+            mixed.push('#');
+            for channel in 0..3 {
+                let a = u32::from([fg_rgb.0, fg_rgb.1, fg_rgb.2][channel]);
+                let b = u32::from([bg_rgb.0, bg_rgb.1, bg_rgb.2][channel]);
+                let value = (a * 20 + b * 80 + 50) / 100;
+                push_hex_byte(&mut mixed, u8::try_from(value).unwrap_or(u8::MAX));
+            }
+            mixed
+        }
+        _ => bg.clone(),
+    };
+    StaticTheme {
+        alt,
+        surface,
+        accent,
+        bg,
+        border,
+        fg,
+        font,
+        line,
+    }
+}
+
+/// The theme value for a public `--ondine-*` variable, when static
+/// mode was given one. Other public variables keep their fallback.
+fn theme_var<'a>(theme: &'a StaticTheme, name: &str) -> Option<&'a str> {
+    match name {
+        "--ondine-accent" => Some(&theme.accent),
+        "--ondine-bg" => Some(&theme.bg),
+        "--ondine-border" => Some(&theme.border),
+        "--ondine-font" => Some(&theme.font),
+        "--ondine-fg" => Some(&theme.fg),
+        "--ondine-line" => Some(&theme.line),
+        "--ondine-surface" => Some(&theme.surface),
+        _ => None,
+    }
+}
+
+/// Finds the index just past the `)` matching the `(` at `open`, or
+/// nothing when the parentheses never balance.
+fn matching_paren(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Splits a `var()` inner expression at its first top-level comma
+/// into the variable name and its fallback, when there is one.
+fn split_var_inner(inner: &str) -> (&str, Option<&str>) {
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                return (
+                    inner.get(..i).unwrap_or("").trim(),
+                    Some(inner.get(i + 1..).unwrap_or("").trim()),
+                );
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (inner.trim(), None)
+}
+
+/// Appends the value of one `var()` inner expression with every
+/// variable resolved. Unknown variables without a fallback are left
+/// as they were: static mode resolves what the theme defines and
+/// never invents a color.
+fn push_var_value(out: &mut String, inner: &str, theme: &StaticTheme, depth: usize) {
+    if depth > 8 {
+        out.push_str("var(");
+        out.push_str(inner);
+        out.push(')');
+        return;
+    }
+    let (name, fallback) = split_var_inner(inner);
+    if let Some(definition) = ALIAS_DEFS
+        .iter()
+        .find(|(alias, _)| *alias == name)
+        .map(|(_, definition)| *definition)
+    {
+        push_resolved_expr(out, definition, theme, depth + 1);
+        return;
+    }
+    if let Some(value) = theme_var(theme, name) {
+        out.push_str(value);
+        return;
+    }
+    if let Some(fallback) = fallback {
+        push_resolved_expr(out, fallback, theme, depth + 1);
+        return;
+    }
+    out.push_str("var(");
+    out.push_str(inner);
+    out.push(')');
+}
+
+/// Appends `expr` with every `var()` in it resolved. A leading
+/// `color-mix()` is computed; anything else is copied through with
+/// only its variables replaced.
+fn push_resolved_expr(out: &mut String, expr: &str, theme: &StaticTheme, depth: usize) {
+    let expr = expr.trim();
+    if expr.starts_with("color-mix(") {
+        if push_color_mix(out, expr, theme, depth) {
+            return;
+        }
+        out.push_str(expr);
+        return;
+    }
+    let bytes = expr.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.get(i..i + 4) == Some(b"var(") {
+            let Some(end) = matching_paren(expr, i + 3) else {
+                break;
+            };
+            out.push_str(expr.get(start..i).unwrap_or(""));
+            let inner = expr.get(i + 4..end - 1).unwrap_or("");
+            push_var_value(out, inner, theme, depth + 1);
+            i = end;
+            start = end;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(expr.get(start..).unwrap_or(""));
+}
+
+/// Resolves one color expression (a `var()`, a hex color, or a
+/// fallback chain of them) to channels. Anything else is not a color
+/// static mode can mix.
+fn resolve_color(expr: &str, theme: &StaticTheme, depth: usize) -> Option<(u8, u8, u8)> {
+    let expr = expr.trim();
+    if expr.starts_with("var(") {
+        let mut resolved = String::new();
+        push_resolved_expr(&mut resolved, expr, theme, depth + 1);
+        parse_hex_color(&resolved)
+    } else {
+        parse_hex_color(expr)
+    }
+}
+
+/// Appends the computed color of a `color-mix(in srgb, A P%, B)` call.
+/// Returns false when the call is not in that shape, so the caller
+/// copies it through unchanged.
+fn push_color_mix(out: &mut String, expr: &str, theme: &StaticTheme, depth: usize) -> bool {
+    let Some(open) = expr.find('(') else {
+        return false;
+    };
+    let Some(end) = matching_paren(expr, open) else {
+        return false;
+    };
+    let inner = expr.get(open + 1..end - 1).unwrap_or("");
+    let Some(inner) = inner.strip_prefix("in srgb,") else {
+        return false;
+    };
+    let bytes = inner.as_bytes();
+    let mut paren_depth = 0i32;
+    let mut split = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth -= 1,
+            b',' if paren_depth == 0 => {
+                split = Some(i);
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let Some(split) = split else {
+        return false;
+    };
+    let first = inner.get(..split).unwrap_or("").trim();
+    let second = inner.get(split + 1..).unwrap_or("").trim();
+    let part = |text: &str| -> Option<((u8, u8, u8), Option<u32>)> {
+        let (color, pct) = match text.rfind(' ') {
+            Some(at) if text.get(at + 1..).unwrap_or("").trim_end().ends_with('%') => (
+                text.get(..at).unwrap_or("").trim(),
+                Some(
+                    text.get(at + 1..)
+                        .unwrap_or("")
+                        .trim()
+                        .trim_end_matches('%')
+                        .parse::<u32>()
+                        .ok()?,
+                ),
+            ),
+            _ => (text, None),
+        };
+        Some((resolve_color(color, theme, depth + 1)?, pct))
+    };
+    let Some((first_rgb, first_pct)) = part(first) else {
+        return false;
+    };
+    let Some((second_rgb, second_pct)) = part(second) else {
+        return false;
+    };
+    let first_weight = first_pct.unwrap_or(100 - second_pct.unwrap_or(50));
+    let second_weight = 100u32.saturating_sub(first_weight);
+    let mix = |a: u8, b: u8| {
+        let value = (u32::from(a) * first_weight + u32::from(b) * second_weight + 50) / 100;
+        u8::try_from(value).unwrap_or(u8::MAX)
+    };
+    out.push('#');
+    push_hex_byte(out, mix(first_rgb.0, second_rgb.0));
+    push_hex_byte(out, mix(first_rgb.1, second_rgb.1));
+    push_hex_byte(out, mix(first_rgb.2, second_rgb.2));
+    true
+}
+
+/// Appends diagram `content` with every `var()` inside a tag resolved
+/// to a concrete value. Text between tags is copied untouched, so a
+/// label that happens to read `var(--_fg)` keeps its literal text.
+fn push_static_content(out: &mut String, content: &str, theme: &StaticTheme) {
+    let bytes = content.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    let mut in_tag = false;
+    let mut in_quote = false;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if in_tag {
+            // Variables live inside quoted attribute values
+            // (`fill="var(--_s)"`), so quote tracking only guards the
+            // tag end: a `>` inside quotes does not close the tag, but
+            // a `var(` inside quotes is still rewritten.
+            if byte == b'"' {
+                in_quote = !in_quote;
+                i += 1;
+                continue;
+            }
+            if !in_quote && byte == b'>' {
+                in_tag = false;
+                i += 1;
+                continue;
+            }
+            if byte == b'v' && bytes.get(i..i + 4) == Some(b"var(") {
+                let Some(end) = matching_paren(content, i + 3) else {
+                    i += 1;
+                    continue;
+                };
+                out.push_str(content.get(start..i).unwrap_or(""));
+                let inner = content.get(i + 4..end - 1).unwrap_or("");
+                push_var_value(out, inner, theme, 0);
+                i = end;
+                start = end;
+                continue;
+            }
+            i += 1;
+        } else {
+            if byte == b'<' {
+                in_tag = true;
+            }
+            i += 1;
+        }
+    }
+    out.push_str(content.get(start..).unwrap_or(""));
+}
+
 /// Wraps a diagram's content in the root `<svg>` document of the given size, with its theme,
 /// font at `font_size`, accessible title and description, and diagram `type` class.
 pub(crate) fn svg_document(
@@ -185,18 +590,28 @@ pub(crate) fn svg_document(
         Cow::Borrowed(content)
     };
 
+    let static_mode = options.inline_theme == Some(true);
+    let theme = static_mode.then(|| static_theme(options));
     let mut weights = String::new();
     if radius {
         weights.push_str(";--_r:");
-        weights.push_str(RADIUS);
+        if static_mode {
+            weights.push('0');
+        } else {
+            weights.push_str(RADIUS);
+        }
     }
     for ((alias, name), used) in WEIGHTS.iter().zip(used) {
         if used {
             weights.push(';');
             weights.push_str(alias);
-            weights.push_str(":var(--ondine-");
-            weights.push_str(name);
-            weights.push_str("-weight,bold)");
+            if static_mode {
+                weights.push_str(":bold");
+            } else {
+                weights.push_str(":var(--ondine-");
+                weights.push_str(name);
+                weights.push_str("-weight,bold)");
+            }
         }
     }
 
@@ -215,18 +630,54 @@ pub(crate) fn svg_document(
     if options.responsive != Some(false) {
         out.push_str("max-width:100%;height:auto;");
     }
-    out.push_str(ROOT_STYLE);
-    out.push_str(&weights);
-    out.push_str(&font_style(font_size));
-    out.push_str(
-        "\" fill=\"var(--_fg)\" role=\"graphics-document document\" aria-roledescription=\"",
-    );
+    if let Some(theme) = &theme {
+        out.push_str("--_bg:");
+        out.push_str(&theme.bg);
+        out.push_str(";--_fg:");
+        out.push_str(&theme.fg);
+        out.push_str(";--_m:");
+        out.push_str(&theme.fg);
+        out.push_str(";--_l:");
+        out.push_str(&theme.line);
+        out.push_str(";--_s:");
+        out.push_str(&theme.surface);
+        out.push_str(";--_a:");
+        out.push_str(&theme.alt);
+        out.push_str(";--_b:");
+        out.push_str(&theme.border);
+        out.push_str(";--_c:");
+        out.push_str(&theme.accent);
+        out.push_str(";--_sw:2px;stroke-width:2px;color:");
+        out.push_str(&theme.fg);
+        out.push_str(&weights);
+        out.push_str(&static_font_style(font_size));
+        out.push_str("\" fill=\"");
+        out.push_str(&theme.fg);
+    } else {
+        out.push_str(ROOT_STYLE);
+        out.push_str(&weights);
+        out.push_str(&font_style(font_size));
+        out.push_str("\" fill=\"var(--_fg)");
+    }
+    out.push_str("\" role=\"graphics-document document\" aria-roledescription=\"");
     out.push_str(r#type);
     out.push('"');
     out.push_str(&aria);
     out.push('>');
     out.push_str(&head);
-    out.push_str(&content);
+    if let Some(theme) = &theme {
+        out.push_str("<g fill=\"");
+        out.push_str(&theme.fg);
+        out.push_str("\" font-size=\"");
+        push_number(&mut out, font_size);
+        out.push_str("px\" font-family=\"");
+        out.push_str(&theme.font);
+        out.push_str("\">");
+        push_static_content(&mut out, &content, theme);
+        out.push_str("</g>");
+    } else {
+        out.push_str(&content);
+    }
     out.push_str("</svg>");
     out
 }

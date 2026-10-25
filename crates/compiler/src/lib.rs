@@ -87,6 +87,16 @@ const DEFAULT_MAX_EDGES: f64 = 5_000.0;
 /// fields, or empty for defaults. `now` is the time a gantt chart schedules against when
 /// `options` sets none, in milliseconds since the epoch. A non-finite `now` means the epoch.
 ///
+/// Setting `"inlineTheme": true` in `options` resolves the theme into
+/// concrete colors, fonts, and stroke widths instead of leaving
+/// `--ondine-*` custom properties for a host stylesheet: the output
+/// then rasterises in resvg, which does not resolve custom properties.
+/// The `themeBackground`, `themeForeground`, `themeLine`,
+/// `themeBorder`, `themeSurface`, `themeAccent`, and `themeFont`
+/// fields choose those concrete values; unset ones fall back to the
+/// monochrome defaults, and all of them are ignored when
+/// `inlineTheme` is absent or false, so default output is unchanged.
+///
 /// # Errors
 ///
 /// Returns an [`Error`] for unsupported diagram types, syntax errors, and exceeded limits.
@@ -277,6 +287,7 @@ fn options_from_json(json: &str) -> Result<svg::root::RenderOptions, Error> {
             "idPrefix" => options.id_prefix = string(value),
             "imageSchemes" => options.image_schemes = strings(value),
             "images" => options.images = boolean(value),
+            "inlineTheme" => options.inline_theme = boolean(value),
             "limit" => options.limit = number(value),
             "linkRel" => options.link_rel = string(value),
             "linkSchemes" => options.link_schemes = strings(value),
@@ -287,6 +298,13 @@ fn options_from_json(json: &str) -> Result<svg::root::RenderOptions, Error> {
             "outputLimit" => options.output_limit = number(value),
             "padding" => options.padding = number(value),
             "responsive" => options.responsive = boolean(value),
+            "themeAccent" => options.theme_accent = string(value),
+            "themeBackground" => options.theme_background = string(value),
+            "themeBorder" => options.theme_border = string(value),
+            "themeFont" => options.theme_font = string(value),
+            "themeForeground" => options.theme_foreground = string(value),
+            "themeLine" => options.theme_line = string(value),
+            "themeSurface" => options.theme_surface = string(value),
             _ => {}
         }
     }
